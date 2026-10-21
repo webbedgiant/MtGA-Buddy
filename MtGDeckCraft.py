@@ -927,13 +927,12 @@ class BrawlOverlayApp(ctk.CTk):
 
         ctk.CTkLabel(row_a, text="Commander:", font=ctk.CTkFont(size=13, weight="bold")).pack(side="left", padx=(0, 6))
         self.cmd_var = ctk.StringVar()
-        self.cmd_combo = ctk.CTkComboBox(
-            row_a, variable=self.cmd_var, width=240,
-            values=["Teval, the Balanced Scale", "Galadriel, Light of Valinor", "Neheb, the Eternal", "Baron Helmut Zemo"]
+        self.cmd_entry = ctk.CTkEntry(
+            row_a, textvariable=self.cmd_var, width=260,
+            placeholder_text="Type a commander name..."
         )
-        self.cmd_combo.pack(side="left", padx=(0, 12))
-        self.cmd_combo.bind("<Return>", lambda _: self.start_search())
-        self.cmd_combo.bind("<KeyRelease>", self._on_commander_keyrelease)
+        self.cmd_entry.pack(side="left", padx=(0, 12))
+        self._build_commander_popup()
 
         ctk.CTkLabel(row_a, text="Format:", font=ctk.CTkFont(size=12, weight="bold")).pack(side="left", padx=(0, 6))
         self.format_var = ctk.StringVar(value="Casual Brawl")
@@ -1189,8 +1188,6 @@ class BrawlOverlayApp(ctk.CTk):
                     self.local_metadata_by_name = meta_name
                     self.grp_ids_by_name = gids_by_name
                     self.commander_list = cmd_list
-                    if cmd_list:
-                        self.after(0, lambda: self.cmd_combo.configure(values=cmd_list[:300]))
                 else:
                     self.status_var.set("Warning: Could not auto-locate Raw_CardDatabase_*.mtga.")
 
@@ -1777,15 +1774,148 @@ class BrawlOverlayApp(ctk.CTk):
                     safe_sheet_name = re.sub(r'[\\/*?:\[\]]', '', str(color_group))[:31] or "Other"
                     group_df.to_excel(writer, sheet_name=safe_sheet_name, index=False)
 
+    # ==================== LIVE COMMANDER AUTOCOMPLETE ====================
+    DEFAULT_COMMANDERS = [
+        "Teval, the Balanced Scale", "Galadriel, Light of Valinor",
+        "Neheb, the Eternal", "Baron Helmut Zemo",
+    ]
+
+    def _build_commander_popup(self):
+        inner = self.cmd_entry._entry  # underlying tk.Entry, so key bindings fire reliably
+        self._cmd_popup = None
+        self._cmd_listbox = None
+        self._cmd_hide_job = None
+
+        inner.bind("<KeyRelease>", self._on_commander_keyrelease)
+        inner.bind("<Down>", self._cmd_nav_down)
+        inner.bind("<Up>", self._cmd_nav_up)
+        inner.bind("<Return>", self._cmd_on_return)
+        inner.bind("<Escape>", lambda _: self._hide_commander_popup())
+        inner.bind("<Button-1>", lambda _: self.after(10, self._update_commander_popup))
+        inner.bind("<FocusOut>", lambda _: self._schedule_hide_commander_popup())
+        self.bind("<Configure>", lambda e: self._hide_commander_popup() if e.widget is self else None, add="+")
+
+    def _commander_matches(self, typed: str, limit: int = 12) -> list[str]:
+        pool = self.commander_list or self.DEFAULT_COMMANDERS
+        t = typed.strip().lower()
+        if not t:
+            return list(pool[:limit])
+        starts, word_starts, contains = [], [], []
+        for name in pool:
+            low = name.lower()
+            if low.startswith(t):
+                starts.append(name)
+            elif f" {t}" in low or f",{t}" in low:
+                word_starts.append(name)
+            elif t in low:
+                contains.append(name)
+        return (starts + word_starts + contains)[:limit]
+
     def _on_commander_keyrelease(self, event):
-        if event.keysym in ("Up", "Down", "Left", "Right", "Return", "Tab"):
+        if event.keysym in ("Up", "Down", "Return", "Escape", "Tab", "Left", "Right", "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R"):
             return
-        typed = self.cmd_var.get().strip().lower()
-        if len(typed) < 2 or not self.commander_list:
+        self._update_commander_popup()
+
+    def _update_commander_popup(self):
+        matches = self._commander_matches(self.cmd_var.get())
+        # nothing useful to show: hide (also hide when the only match is exactly what's typed)
+        if not matches or (len(matches) == 1 and matches[0].lower() == self.cmd_var.get().strip().lower()):
+            self._hide_commander_popup()
             return
-        matches = [c for c in self.commander_list if typed in c.lower()][:40]
-        if matches:
-            self.cmd_combo.configure(values=matches)
+
+        if self._cmd_hide_job:
+            self.after_cancel(self._cmd_hide_job)
+            self._cmd_hide_job = None
+
+        if self._cmd_popup is None or not self._cmd_popup.winfo_exists():
+            popup = tk.Toplevel(self)
+            popup.withdraw()
+            popup.overrideredirect(True)
+            popup.attributes("-topmost", True)
+            lb = tk.Listbox(
+                popup, activestyle="none", exportselection=False,
+                bg="#1e1e24", fg="#f4f4f5", selectbackground="#3b82f6", selectforeground="#ffffff",
+                font=("Segoe UI", 10), borderwidth=1, relief="solid", highlightthickness=0
+            )
+            lb.pack(fill="both", expand=True)
+            lb.bind("<ButtonRelease-1>", self._cmd_on_click)
+            lb.bind("<Motion>", self._cmd_on_hover)
+            self._cmd_popup, self._cmd_listbox = popup, lb
+
+        lb = self._cmd_listbox
+        lb.delete(0, tk.END)
+        for name in matches:
+            lb.insert(tk.END, name)
+
+        self.update_idletasks()
+        x = self.cmd_entry.winfo_rootx()
+        y = self.cmd_entry.winfo_rooty() + self.cmd_entry.winfo_height() + 2
+        rows = min(len(matches), 12)
+        lb.configure(height=rows)
+        width = max(self.cmd_entry.winfo_width(), 300)
+        self._cmd_popup.geometry(f"{width}x{rows * 20 + 6}+{x}+{y}")
+        self._cmd_popup.deiconify()
+        self._cmd_popup.lift()
+
+    def _hide_commander_popup(self):
+        if self._cmd_popup is not None and self._cmd_popup.winfo_exists():
+            self._cmd_popup.withdraw()
+
+    def _schedule_hide_commander_popup(self):
+        # small delay so a click on the list still registers before the popup disappears
+        if self._cmd_hide_job:
+            self.after_cancel(self._cmd_hide_job)
+        self._cmd_hide_job = self.after(200, self._hide_commander_popup)
+
+    def _cmd_popup_visible(self) -> bool:
+        return bool(self._cmd_popup is not None and self._cmd_popup.winfo_exists() and self._cmd_popup.winfo_viewable())
+
+    def _cmd_choose(self, name: str):
+        self.cmd_var.set(name)
+        self._hide_commander_popup()
+        self.cmd_entry._entry.focus_set()
+        self.cmd_entry._entry.icursor(tk.END)
+
+    def _cmd_on_click(self, event):
+        idx = self._cmd_listbox.nearest(event.y)
+        if 0 <= idx < self._cmd_listbox.size():
+            self._cmd_choose(self._cmd_listbox.get(idx))
+
+    def _cmd_on_hover(self, event):
+        idx = self._cmd_listbox.nearest(event.y)
+        self._cmd_listbox.selection_clear(0, tk.END)
+        if 0 <= idx < self._cmd_listbox.size():
+            self._cmd_listbox.selection_set(idx)
+
+    def _cmd_move_selection(self, delta: int):
+        if not self._cmd_popup_visible():
+            self._update_commander_popup()
+            if not self._cmd_popup_visible():
+                return "break"
+        lb = self._cmd_listbox
+        cur = lb.curselection()
+        new_idx = (cur[0] + delta) if cur else (0 if delta > 0 else lb.size() - 1)
+        new_idx = max(0, min(lb.size() - 1, new_idx))
+        lb.selection_clear(0, tk.END)
+        lb.selection_set(new_idx)
+        lb.see(new_idx)
+        return "break"
+
+    def _cmd_nav_down(self, _event):
+        return self._cmd_move_selection(1)
+
+    def _cmd_nav_up(self, _event):
+        return self._cmd_move_selection(-1)
+
+    def _cmd_on_return(self, _event):
+        if self._cmd_popup_visible():
+            cur = self._cmd_listbox.curselection()
+            if cur:
+                self._cmd_choose(self._cmd_listbox.get(cur[0]))
+                return "break"
+        self._hide_commander_popup()
+        self.start_search()
+        return "break"
 
     # ==================== MOXFIELD BRAWL DECK SEARCH & ACCURATE DIFF ====================
     def start_search(self):
@@ -2362,6 +2492,7 @@ class BrawlOverlayApp(ctk.CTk):
 
     def toggle_visibility(self):
         if self.visible:
+            self._hide_commander_popup()
             self.withdraw()
             self.visible = False
         else:
